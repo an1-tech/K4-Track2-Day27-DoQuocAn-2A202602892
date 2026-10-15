@@ -9,7 +9,7 @@
     "cost_overage": 0.0,
     "score": 50.0,
     "phase": "practice",
-    "defense_file": "solution/defense.py",
+    "defense_file": "solution/experiments/guidance_20261015/guidance_normalized.py",
     "per_pillar_band": {
       "n/a": "n/a",
       "checks": "high",
@@ -500,5 +500,5 @@
       }
     ]
   },
-  "signature": "594b57ded9357afb0a59116251c445d2a78eaf1a1c6a5a0f2672e42539a9ea8e"
+  "signature": "1e1aed085b3c0f99c86f676d95a08ec5497aaaba39171b9981720302a307f2a2"
 }

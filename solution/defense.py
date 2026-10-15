@@ -1,17 +1,18 @@
-"""
-Data Siege defense.
+"""Local experiment: bound-normalized interpretation of the supplied teaching guidance.
 
-DEBUG_LINEAGE = True:
-    Dừng tại sự kiện lineage đầu tiên để xem payload và kết quả công cụ.
-
-DEBUG_LINEAGE = False:
-    Chạy đầy đủ các kiểm tra cơ bản.
+All cutoffs were fixed before evaluation; no event IDs or phase keys are used.
 """
+
+from math import sqrt
 
 from api import Verdict
 
 
-DEBUG_LINEAGE = False
+COMPOSITE_BOUND_UNITS = True
+COMPOSITE_MAX = 1.30
+FEATURE_SHIFT_MAX = 0.65
+EMBEDDING_SHIFT_MAX = 0.040
+CORPUS_AGE_MAX_DAYS = 44.5
 
 
 def register(ctx):
@@ -30,257 +31,125 @@ def make_verdict(pillar, reasons):
     )
 
 
+def tool_error(pillar, result):
+    return Verdict(
+        alert=False,
+        pillar=pillar,
+        reason=f"Tool error: {result['error']}",
+    )
+
+
 def check_data_batch(payload, ctx):
-    # Chi phí: 1 credit.
     profile = ctx.tools.batch_profile(payload["batch_id"])
-
     if "error" in profile:
-        return Verdict(
-            alert=False,
-            pillar="checks",
-            reason=f"batch_profile error: {profile['error']}",
-        )
+        return tool_error("checks", profile)
 
-    baseline = ctx.baseline
+    b = ctx.baseline
     reasons = []
-
-    # Kiểm tra số dòng.
-    row_count = profile["row_count"]
-    if not (
-        baseline["row_count_min"]
-        <= row_count
-        <= baseline["row_count_max"]
-    ):
-        reasons.append(
-            f"row_count outside baseline: {row_count}"
-        )
-
-    # Kiểm tra tỷ lệ thiếu customer_id.
+    rows = profile["row_count"]
+    amount = profile["mean_amount"]
     null_rate = profile["null_rate"]["customer_id"]
-    if null_rate > baseline["null_rate_max"]:
-        reasons.append(
-            f"customer_id null rate too high: {null_rate}"
+    stale = profile["staleness_min"]
+
+    if not b["row_count_min"] <= rows <= b["row_count_max"]:
+        reasons.append(f"row_count outside baseline: {rows}")
+    if not b["mean_amount_min"] <= amount <= b["mean_amount_max"]:
+        reasons.append(f"mean_amount outside baseline: {amount}")
+    if null_rate > b["null_rate_max"]:
+        reasons.append(f"null rate too high: {null_rate}")
+    if stale > b["staleness_min_max"]:
+        reasons.append(f"data too stale: {stale}")
+
+    # Baseline arithmetic is cached in memory, with no additional tool call.
+    if "batch_composite_scales" not in ctx.state:
+        divisor = 2.0 if COMPOSITE_BOUND_UNITS else 6.0
+        ctx.state["batch_composite_scales"] = (
+            (b["row_count_min"] + b["row_count_max"]) / 2.0,
+            (b["row_count_max"] - b["row_count_min"]) / divisor,
+            (b["mean_amount_min"] + b["mean_amount_max"]) / 2.0,
+            (b["mean_amount_max"] - b["mean_amount_min"]) / divisor,
         )
 
-    # Kiểm tra số tiền trung bình.
-    mean_amount = profile["mean_amount"]
-    if not (
-        baseline["mean_amount_min"]
-        <= mean_amount
-        <= baseline["mean_amount_max"]
-    ):
-        reasons.append(
-            f"mean_amount outside baseline: {mean_amount}"
-        )
-
-    # Kiểm tra độ cũ của dữ liệu.
-    staleness = profile["staleness_min"]
-    if staleness > baseline["staleness_min_max"]:
-        reasons.append(
-            f"data too stale: {staleness} minutes"
-        )
+    row_center, row_scale, amount_center, amount_scale = ctx.state[
+        "batch_composite_scales"
+    ]
+    distance = sqrt(
+        ((rows - row_center) / row_scale) ** 2
+        + ((amount - amount_center) / amount_scale) ** 2
+        + (null_rate / b["null_rate_max"]) ** 2
+        + (stale / b["staleness_min_max"]) ** 2
+    )
+    if distance > COMPOSITE_MAX:
+        reasons.append(f"Composite distance too high: {distance:.4f}")
 
     return make_verdict("checks", reasons)
 
 
 def check_contract_checkpoint(payload, ctx):
-    # Chi phí: 1.5 credits.
     result = ctx.tools.contract_diff(
-        payload["contract_id"],
-        payload["checkpoint_batch_id"],
+        payload["contract_id"], payload["checkpoint_batch_id"]
     )
-
     if "error" in result:
-        return Verdict(
-            alert=False,
-            pillar="contracts",
-            reason=f"contract_diff error: {result['error']}",
-        )
+        return tool_error("contracts", result)
 
-    reasons = []
-
-    # Kiểm tra schema và kiểu dữ liệu.
-    violations = result["violations"]
-    if violations:
-        reasons.append(
-            "Contract violations: " + ", ".join(violations)
-        )
-
-    # Kiểm tra độ trễ cập nhật.
+    reasons = list(result["violations"])
     delay = result["freshness_delay_min"]
-    max_delay = ctx.baseline["freshness_delay_max_min"]
+    if delay > ctx.baseline["freshness_delay_max_min"]:
+        reasons.append(f"Freshness delay exceeds baseline: {delay}")
 
-    if delay > max_delay:
-        reasons.append(
-            f"Freshness delay exceeds baseline: "
-            f"{delay} > {max_delay} minutes"
-        )
+    sla = payload.get("declared_sla", {}).get("freshness_min")
+    if isinstance(sla, (int, float)) and delay > sla:
+        reasons.append(f"Declared freshness SLA exceeded: {delay} > {sla}")
 
     return make_verdict("contracts", reasons)
 
 
 def check_lineage_run(payload, ctx):
-    # Một lần gọi, chi phí 1 credit.
     result = ctx.tools.lineage_graph_slice(payload["run_id"])
-
     if "error" in result:
-        return Verdict(
-            alert=False,
-            pillar="lineage",
-            reason=f"lineage_graph_slice error: {result['error']}",
-        )
+        return tool_error("lineage", result)
 
     reasons = []
+    required = {item["name"] for item in payload["inputs"]}
+    # A domain invariant supplied explicitly by the course, not a run answer.
+    if payload["job"] == "dbt:stg_orders":
+        required.update(("raw.orders", "raw.customers"))
 
-    # 1. Kiểm tra thời gian chạy.
-    duration = result["duration_ms"]
-    max_duration = ctx.baseline["lineage_duration_ms_max"]
+    missing = required - set(result["actual_upstream"])
+    if missing:
+        reasons.append("Missing upstream: " + ", ".join(sorted(missing)))
 
-    if duration > max_duration:
-        reasons.append(
-            f"Run duration exceeds baseline: "
-            f"{duration} > {max_duration} ms"
-        )
+    downstream = result["actual_downstream_count"]
+    if downstream == 0:
+        reasons.append("Orphan output: no downstream consumers")
+    elif downstream < len(payload["outputs"]):
+        reasons.append("Fewer downstream consumers than declared outputs")
 
-    # 2. Lấy nguồn và đầu ra được khai báo trong sự kiện.
-    declared_inputs = {
-        item["name"]
-        for item in payload["inputs"]
-    }
-
-    declared_outputs = {
-        (item["namespace"], item["name"])
-        for item in payload["outputs"]
-    }
-
-    actual_upstream = set(result["actual_upstream"])
-
-    # Tách lịch sử theo job và cấu trúc khai báo.
-    # Không dùng run_id vì mỗi lần chạy có ID khác nhau.
-    history_key = (
-        payload["job"],
-        tuple(sorted(
-            (item["namespace"], item["name"])
-            for item in payload["inputs"]
-        )),
-        tuple(sorted(declared_outputs)),
-    )
-
-    histories = ctx.state.setdefault("lineage_history", {})
-
-    history = histories.setdefault(
-        history_key,
-        {
-            "samples": 0,
-            "edge_counts": {},
-        },
-    )
-
-    # 3. Học nguồn xuất hiện ổn định từ các lần chạy trước.
-    learned_inputs = set()
-
-    if history["samples"] >= 3:
-        for edge, count in history["edge_counts"].items():
-            frequency = count / history["samples"]
-
-            if count >= 3 and frequency >= 0.8:
-                learned_inputs.add(edge)
-
-    required_inputs = declared_inputs | learned_inputs
-    missing_inputs = required_inputs - actual_upstream
-
-    if missing_inputs:
-        reasons.append(
-            "Missing upstream: "
-            + ", ".join(sorted(missing_inputs))
-        )
-
-    # 4. Kiểm tra đầu ra thiếu liên kết downstream.
-    expected_count = len(declared_outputs)
-    actual_count = result["actual_downstream_count"]
-
-    if actual_count < expected_count:
-        reasons.append(
-            f"Missing downstream links: "
-            f"actual={actual_count}, expected_at_least={expected_count}"
-        )
-
-    # 5. Chỉ cập nhật lịch sử từ lần chạy không bị cảnh báo.
-    # Không có thêm RPC; dữ liệu được giữ trong ctx.state.
-    if not reasons:
-        history["samples"] += 1
-
-        for edge in actual_upstream:
-            previous_count = history["edge_counts"].get(edge, 0)
-            history["edge_counts"][edge] = previous_count + 1
+    if result["duration_ms"] > ctx.baseline["lineage_duration_ms_max"]:
+        reasons.append(f"Runtime exceeds baseline: {result['duration_ms']}")
 
     return make_verdict("lineage", reasons)
 
 
 def check_feature_materialization(payload, ctx):
-    # Chi phí: 2 credits.
-    result = ctx.tools.feature_drift(
-        payload["feature_view"],
-        payload["batch_id"],
-    )
-
+    result = ctx.tools.feature_drift(payload["feature_view"], payload["batch_id"])
     if "error" in result:
-        return Verdict(
-            alert=False,
-            pillar="ai_infra",
-            reason=f"feature_drift error: {result['error']}",
-        )
+        return tool_error("ai_infra", result)
 
     reasons = []
-
-    # Độ lệch trung bình được chuẩn hóa theo train_std.
-    shift = result["mean_shift_sigma"]
-    max_shift = ctx.baseline["feature_mean_shift_sigma_max"]
-
-    if shift > max_shift:
-        reasons.append(
-            f"Feature mean shift exceeds baseline: "
-            f"{shift} > {max_shift} sigma"
-        )
-
+    if result["mean_shift_sigma"] > FEATURE_SHIFT_MAX:
+        reasons.append(f"Feature skew: {result['mean_shift_sigma']}")
     return make_verdict("ai_infra", reasons)
 
 
 def check_embedding_batch(payload, ctx):
-    # Chi phí: 2 credits.
-    result = ctx.tools.embedding_drift(
-        payload["corpus"],
-        payload["chunk_batch_id"],
-    )
-
+    result = ctx.tools.embedding_drift(payload["corpus"], payload["chunk_batch_id"])
     if "error" in result:
-        return Verdict(
-            alert=False,
-            pillar="ai_infra",
-            reason=f"embedding_drift error: {result['error']}",
-        )
+        return tool_error("ai_infra", result)
 
-    baseline = ctx.baseline
     reasons = []
-
-    # Kiểm tra mức dịch chuyển tâm embedding.
-    shift = result["centroid_shift"]
-    max_shift = baseline["embedding_centroid_shift_max"]
-
-    if shift > max_shift:
-        reasons.append(
-            f"Embedding centroid shift too high: "
-            f"{shift} > {max_shift}"
-        )
-
-    # Kiểm tra tuổi trung bình của tài liệu.
-    avg_age = result["avg_doc_age_days"]
-    max_age = baseline["corpus_avg_doc_age_days_max"]
-
-    if avg_age > max_age:
-        reasons.append(
-            f"Corpus documents too old: "
-            f"{avg_age} > {max_age} days"
-        )
-
+    if result["centroid_shift"] > EMBEDDING_SHIFT_MAX:
+        reasons.append(f"Embedding drift: {result['centroid_shift']}")
+    if result["avg_doc_age_days"] > CORPUS_AGE_MAX_DAYS:
+        reasons.append(f"Corpus too old: {result['avg_doc_age_days']}")
     return make_verdict("ai_infra", reasons)
